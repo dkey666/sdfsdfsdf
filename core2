@@ -1,0 +1,719 @@
+<?php
+
+use GuzzleHttp\Client;
+
+include('vendor/autoload.php');
+include('telegramBot.php');
+include('SqlAPI.php');
+include('UserAPI.php');
+include('ExcelAPI.php');
+
+$verifiedData = new UserAPI();
+$excelData = new ExcelAPI();
+
+//Получаем данные
+$telegramApi = new TelegramBot(json_decode(file_get_contents("config.json"), true)["telegram_token"]);
+
+echo('BOT started!' . PHP_EOL);
+
+const WAITING_NUMBER_TO_SEARCH = 1;
+const WAITING_FIO_TO_SEARCH = 2;
+const WAITING_FOR_VERIFY_USERNAME = 3;
+const WAITING_FOR_SUPPORT_TICKET = 4;
+const WAITING_FOR_ANNOUNCEMENT = 5;
+const WAITING_FOR_DELETE = 6;
+const WAITING_FOR_PHOTO_ADD = 7;
+const WAITING_FOR_PHOTOS_DELETE = 8;
+
+// Вычный цикл, обработчик
+while (true) {
+    sleep(1);
+    $updates = $telegramApi->getUpdates(); // Получаем обновление, методом getUpdates
+    foreach ($updates as $update){
+        if (isset($update->message->text) || isset($update->message->caption)) { // Проверяем Update, на наличие текста
+
+            $text = ""; // Переменная с текстом сообщения
+            if(isset($update->message->text)) $text = $update->message->text;
+            if(isset($update->message->caption)) $text = $update->message->caption;
+            $userId = $update->message->from->id;
+            $chat_id = $update->message->chat->id; // Чат ID пользователя
+            $first_name = $update->message->chat->first_name; //Имя пользователя
+            $username = $update->message->chat->username; //Юзернейм пользователя
+
+            $userData = $verifiedData->getData(strval($userId));
+            if(!$userData)
+            {
+                echo("Creating user ID " . $userId . " | NAME " . $first_name . PHP_EOL);
+                $verifiedData->createDataFor(strval($userId));
+                $userData = $verifiedData->getData(strval($userId));
+                if(!$userData) continue; #impossible
+                $userData["chat_id"] = $chat_id;
+                $userData["telegram_id"] = $userId;
+                $verifiedData->updateData(strval($userId), $userData);
+            }
+
+            if($userData["chat_action"] > 0)
+            {
+                $act = $userData["chat_action"];
+                $userData["chat_action"] = 0;
+                $userData["chat_id"] = $chat_id;
+                $userData["telegram_id"] = $userId;
+                $verifiedData->updateData(strval($userId), $userData);
+
+                switch ($act)
+                {
+
+                    case WAITING_FOR_PHOTOS_DELETE:
+
+                        $number = str_replace("+", "", $text);
+
+                        $target = $excelData->getData($number);
+                        if(!$target)
+                        {
+                            $telegramApi->sendMessage($chat_id, "Пользователь с таким номером не найден!");
+                            break;
+                        }
+
+                        $target["photos"] = [];
+                        $excelData->updateData($number, $target);
+
+                        $telegramApi->sendMessage($chat_id, "Все фото <" . $target["fio"] . "> - были удалены!");
+
+                        break;
+
+                    case WAITING_FOR_PHOTO_ADD:
+
+                        if(!isset($update->message->photo))
+                        {
+                            $telegramApi->sendMessage($chat_id, "Вы не прикрепили фото к сообщению!");
+                            break;
+                        }
+
+                        $number = str_replace("+", "", $text);
+
+                        $target = $excelData->getData($number);
+                        if(!$target)
+                        {
+                            $telegramApi->sendMessage($chat_id, "Пользователь с таким номером не найден!");
+                            break;
+                        }
+
+                        $photos = $target["photos"];
+                        if($photos == null) $photos = [];
+                        array_push($photos, $update->message->photo[0]->file_id);
+
+                        $telegramApi->sendMessage($chat_id, "Фото добавлено пользователю <" . $target["fio"] . ">");
+
+                        $target["photos"] = $photos;
+                        $excelData->updateData($number, $target);
+
+                        break;
+
+                    case WAITING_FOR_ANNOUNCEMENT:
+
+                        print_r($update->message->photo[0]);
+
+                        foreach ($verifiedData->getAll() as $targetKey)
+                        {
+                            $target = $verifiedData->getData($targetKey["user"]);
+                            if(!$target) continue;
+                            if(isset($update->message->photo))
+                            {
+                                $telegramApi->sendPhoto($target["telegram_id"], $update->message->photo[0]->file_id, $text);
+                            }else
+                            {
+                                $telegramApi->sendMessage($target["telegram_id"], $text);
+                            }
+                        }
+
+                        $telegramApi->sendMessage($chat_id, "Рассылка успешно отправлена!");
+
+                        break;
+
+                    case WAITING_FOR_SUPPORT_TICKET:
+
+                        $telegramApi->sendMessage($chat_id, "Заявка успешно отправлена администрации!");
+
+                        foreach ($verifiedData->getAll() as $targetKey)
+                        {
+                            $target = $verifiedData->getData($targetKey["user"]);
+                            if(!$target) continue;
+                            if($target["is_admin"])
+                            {
+                                if(strlen($userData["verify_username"]) < 1)
+                                {
+                                    $telegramApi->sendMessage($target["telegram_id"], "Пользователь с ID'" . $userId . "' -> Обратился в поддержку с обращением: < " . $text . ">." .
+                                        "\nИспользуйте: /идответ " . $userId . " сообщение -> для ответа!");
+                                }else
+                                {
+                                    $telegramApi->sendMessage($target["telegram_id"], "Пользователь '" . $userData["verify_username"] . "' -> Обратился в поддержку с обращением: < " . $text . ">." .
+                                        "\nИспользуйте: /ответ " . $userData["verify_username"] . " сообщение -> для ответа!");
+                                }
+                            }
+                        }
+
+                        break;
+
+                    case WAITING_FOR_VERIFY_USERNAME:
+
+                        $allowedName = true;
+
+                        foreach ($verifiedData->getAll() as $targetKey)
+                        {
+                            $target = $verifiedData->getData($targetKey["user"]);
+                            if(!$target) continue;
+                            if($target["verify_username"] == $text)
+                            {
+                                $allowedName = false;
+                                $telegramApi->sendMessage($chat_id, "Пользователь с таким никнеймом уже существует! Заявка не отправлена..." . $text);
+                            }
+                        }
+
+                        if($allowedName)
+                        {
+                            $userData["verify_username"] = $text;
+                            $verifiedData->updateData(strval($userId), $userData);
+
+                            $telegramApi->sendMessage($chat_id, "Заявка успешно отправлена администрации!");
+
+                            foreach ($verifiedData->getAll() as $targetKey)
+                            {
+                                $target = $verifiedData->getData($targetKey["user"]);
+                                if(!$target) continue;
+                                if($target["is_admin"])
+                                {
+                                    $telegramApi->sendMessage($target["telegram_id"], "Пользователь с никнеймом '" . $text . "' -> отправил заявку на верификацию. Для подтверждения используйте: /подтвердить " . $text);
+                                }
+                            }
+                        }
+
+                        break;
+
+                    case WAITING_FIO_TO_SEARCH:
+
+                        $found = false;
+
+                        foreach ($excelData->getAll() as $targetKey)
+                        {
+                            $target = $excelData->getData($targetKey["user"]);
+                            if(!$target) continue;
+
+                            $targetFio = explode(' ', $target["fio"]);
+                            $targetFio = $targetFio[0] . " " . $targetFio[1];
+
+                            if(strtolower($targetFio) == strtolower($text) || $targetFio == $text
+                            || $target["fio"] == $text)
+                            {
+                                $reply = "ФИО: " . $target["fio"]
+                                    . "\nНомер телефона: " . $target["number"]
+                                    . "\nПочта: " . $target["email"];
+
+                                if($userData["verified"] || $userData["is_admin"])
+                                {
+                                    $reply .= "\nАдрес: " . $target["address"]
+                                        . "\nПаспорт: " . $target["passport"]
+                                        . "\nСоц.сети: " . $target["social"]
+                                        . "\nПрочая информация: " . $target["another"]
+                                        . "\nФотографии:";
+                                }
+
+                                $found = true;
+
+                                $telegramApi->sendMessage($chat_id, $reply);
+
+                                if($userData["verified"] || $userData["is_admin"])
+                                {
+                                    foreach($target["photos"] as $photoId)
+                                    {
+                                        $telegramApi->sendPhoto($chat_id, $photoId);
+                                    }
+                                }
+                                break;
+                            }
+                        }
+
+                        if(!$found)
+                        {
+                            $keyboard = [
+                                'inline_keyboard' => [
+                                    [
+                                        ['text' => 'По номеру', 'callback_data' => 'searchByNumber'],
+                                        ['text' => 'По фио', 'callback_data' => 'searchByFIO']
+                                    ]
+                                ]
+                            ];
+                            $encodedKeyboard = json_encode($keyboard);
+                            $telegramApi->sendMessageKeyborad($chat_id, "Пользователь с таким именем и фамилией не найден! Убедитесь, что вы ввели по формату 'Фамилия Имя'", $encodedKeyboard);
+                        }
+
+                        break;
+
+                    case WAITING_FOR_DELETE:
+
+                        $number = str_replace("+", "", $text);
+
+                        $target = $excelData->getData($number);
+                        if(!$target)
+                        {
+                            $telegramApi->sendMessage($chat_id, "Пользователь с таким номером не найден!");
+                            break;
+                        }
+
+                        $excelData->deleteData($target["number"]);
+
+                        $telegramApi->sendMessage($chat_id, $target["fio"] . " -> удалён!");
+
+                        break;
+
+                    case WAITING_NUMBER_TO_SEARCH:
+
+                        $number = str_replace("+", "", $text);
+
+                        $target = $excelData->getData($number);
+                        if(!$target)
+                        {
+                            $keyboard = [
+                                'inline_keyboard' => [
+                                    [
+                                        ['text' => 'По номеру', 'callback_data' => 'searchByNumber'],
+                                        ['text' => 'По фио', 'callback_data' => 'searchByFIO']
+                                    ]
+                                ]
+                            ];
+                            $encodedKeyboard = json_encode($keyboard);
+                            $telegramApi->sendMessageKeyborad($chat_id, "Пользователь с таким номером не найден!", $encodedKeyboard);
+                            break;
+                        }
+
+                        $reply = "ФИО: " . $target["fio"]
+                            . "\nНомер телефона: " . $target["number"]
+                            . "\nПочта: " . $target["email"];
+
+                        if($userData["verified"] || $userData["is_admin"])
+                        {
+                            $reply .= "\nАдрес: " . $target["address"]
+                                . "\nПаспорт: " . $target["passport"]
+                                . "\nСоц.сети: " . $target["social"]
+                                . "\nПрочая информация: " . $target["another"]
+                                . "\nФотографии:";
+                        }
+
+                        $telegramApi->sendMessage($chat_id, $reply);
+
+                        if($userData["verified"] || $userData["is_admin"])
+                        {
+                            foreach($target["photos"] as $photoId)
+                            {
+                                $telegramApi->sendPhoto($chat_id, $photoId);
+                            }
+                        }
+
+                        break;
+                }
+                continue;
+            }
+
+            if ($text == '/start') { // Если пользователь подключился в первый раз, ему поступит приветствие
+                $telegramApi->sendMessage($chat_id, "/start -> Список команд".
+"\n/поиск -> Поиск пользователя по ID/ФИО".
+"\n/верификация -> Отправить заявку на верификацию".
+"\n/поддержка -> Отправить запрос в поддержку");
+            }else if($text == "/удфото")
+            {
+                if(!$userData["is_admin"])
+                {
+                    $telegramApi->sendMessage($chat_id, "Нет доступа.");
+                    continue;
+                }
+
+                $keyboard = [
+                    'inline_keyboard' => [
+                        [
+                            ['text' => 'Отмена', 'callback_data' => 'cancelAction']
+                        ]
+                    ]
+                ];
+                $encodedKeyboard = json_encode($keyboard);
+
+                $telegramApi->sendMessageKeyborad($chat_id, "Отправьте в следующем сообщении номер пользователя для удаления всех его фотографий:", $encodedKeyboard);
+
+                $userData["chat_action"] = WAITING_FOR_PHOTOS_DELETE;
+                $verifiedData->updateData(strval($userId), $userData);
+            }
+            else if($text == "/дфото")
+            {
+                if(!$userData["is_admin"])
+                {
+                    $telegramApi->sendMessage($chat_id, "Нет доступа.");
+                    continue;
+                }
+
+                $keyboard = [
+                    'inline_keyboard' => [
+                        [
+                            ['text' => 'Отмена', 'callback_data' => 'cancelAction']
+                        ]
+                    ]
+                ];
+                $encodedKeyboard = json_encode($keyboard);
+
+                $telegramApi->sendMessageKeyborad($chat_id, "Отправьте в следующем сообщении номер пользователя и фото:", $encodedKeyboard);
+
+                $userData["chat_action"] = WAITING_FOR_PHOTO_ADD;
+                $verifiedData->updateData(strval($userId), $userData);
+
+            }else if($text == "/удалить")
+            {
+                if(!$userData["is_admin"])
+                {
+                    $telegramApi->sendMessage($chat_id, "Нет доступа.");
+                    continue;
+                }
+
+                $keyboard = [
+                    'inline_keyboard' => [
+                        [
+                            ['text' => 'Отмена', 'callback_data' => 'cancelAction']
+                        ]
+                    ]
+                ];
+                $encodedKeyboard = json_encode($keyboard);
+
+                $telegramApi->sendMessageKeyborad($chat_id, "Отправьте номер пользователя в следующем сообщении, чтобы удалить:", $encodedKeyboard);
+
+                $userData["chat_action"] = WAITING_FOR_DELETE;
+                $verifiedData->updateData(strval($userId), $userData);
+            }
+            else if($text == "/рассылка") {
+                if(!$userData["is_admin"])
+                {
+                    $telegramApi->sendMessage($chat_id, "Нет доступа.");
+                    continue;
+                }
+
+                $keyboard = [
+                    'inline_keyboard' => [
+                        [
+                            ['text' => 'Отмена', 'callback_data' => 'cancelAction']
+                        ]
+                    ]
+                ];
+                $encodedKeyboard = json_encode($keyboard);
+
+                $telegramApi->sendMessageKeyborad($chat_id, "Отправьте текст на рассылку в следующем сообщении!", $encodedKeyboard);
+
+                $userData["chat_action"] = WAITING_FOR_ANNOUNCEMENT;
+                $verifiedData->updateData(strval($userId), $userData);
+
+            }else if($text == "/статистика")
+            {
+                if(!$userData["is_admin"])
+                {
+                    $telegramApi->sendMessage($chat_id, "Нет доступа.");
+                    continue;
+                }
+
+                $registered = count($verifiedData->getAll());
+                $excelRegistered = count($excelData->getAll());
+
+                $telegramApi->sendMessage($chat_id, "Пользователей в боте: " . $registered
+                    . "\nПользователей с Excel таблицы: " . $excelRegistered);
+            }
+            else if($text == "/поддержка")
+            {
+                $keyboard = [
+                    'inline_keyboard' => [
+                        [
+                            ['text' => 'Отмена', 'callback_data' => 'cancelAction']
+                        ]
+                    ]
+                ];
+                $encodedKeyboard = json_encode($keyboard);
+
+                $telegramApi->sendMessageKeyborad($chat_id, "Введите текс обращения в следующем сообщении, чтобы отправить заявку:", $encodedKeyboard);
+
+                $userData["chat_action"] = WAITING_FOR_SUPPORT_TICKET;
+                $verifiedData->updateData(strval($userId), $userData);
+            }else if(explode(' ', $text)[0] == "/идответ")
+            {
+                if(!$userData["is_admin"])
+                {
+                    $telegramApi->sendMessage($chat_id, "Нет доступа.");
+                    continue;
+                }
+
+                $args = explode(' ', $text);
+                if(!isset($args[2]))
+                {
+                    $telegramApi->sendMessage($chat_id, "Ответ пользователю не указан!");
+                    continue;
+                }
+
+                $nick = $args[1];
+
+                unset($args[1]);
+                unset($args[0]);
+                $res = implode(' ', $args);
+
+                $target = $verifiedData->getData($nick);
+                if(!$target)
+                {
+                    $telegramApi->sendMessage($chat_id, "Пользователь с таким ID не найден!");
+                    continue;
+                }
+                $telegramApi->sendMessage($target["telegram_id"], "Пришёл ответ от администрации:\n" . $res);
+                $telegramApi->sendMessage($chat_id, "Ответ <" . $res . "> доставлен пользователю с ID <" . $nick . ">");
+            }
+            else if(explode(' ', $text)[0] == "/ответ")
+            {
+                if(!$userData["is_admin"])
+                {
+                    $telegramApi->sendMessage($chat_id, "Нет доступа.");
+                    continue;
+                }
+
+                $args = explode(' ', $text);
+                if(!isset($args[2]))
+                {
+                    $telegramApi->sendMessage($chat_id, "Ответ пользователю не указан!");
+                    continue;
+                }
+
+                $nick = $args[1];
+                $found = false;
+                unset($args[1]);
+                unset($args[0]);
+                $res = implode(' ', $args);
+
+                foreach ($verifiedData->getAll() as $targetKey)
+                {
+                    $target = $verifiedData->getData($targetKey["user"]);
+                    if(!$target) continue;
+                    if($target["verify_username"] == $nick)
+                    {
+                        $found = true;
+                        $telegramApi->sendMessage($target["telegram_id"], "Пришёл ответ от администрации:\n" . $res);
+                        $telegramApi->sendMessage($chat_id, "Ответ <" . $res . "> доставлен пользователю <" . $nick . ">");
+                    }
+                }
+
+                if(!$found)
+                {
+                    $telegramApi->sendMessage($chat_id, "Пользователь с таким ником не найден!");
+                }
+            }
+            else if(explode(' ', $text)[0] == "/подтвердить")
+            {
+                if(!$userData["is_admin"])
+                {
+                    $telegramApi->sendMessage($chat_id, "Нет доступа.");
+                    continue;
+                }
+
+                $args = explode(' ', $text);
+                if(!isset($args[1]))
+                {
+                    $telegramApi->sendMessage($chat_id, "Никнейм пользователя не указан!");
+                    continue;
+                }
+
+                $nick = $args[1];
+                $found = false;
+
+                foreach ($verifiedData->getAll() as $targetKey)
+                {
+                    $target = $verifiedData->getData($targetKey["user"]);
+                    if(!$target) continue;
+                    if($target["verify_username"] == $nick)
+                    {
+                        $found = true;
+                        $target["verified"] = !$target["verified"];
+                        $verifiedData->updateData($targetKey["user"], $target);
+                        $status = $target["verified"] ? "Подтвержденный" : "Не подтвержденный";
+                        $telegramApi->sendMessage($chat_id, "Статус пользователя <" . $nick . "> -> Изменён на " . $status
+                            . "\nОтправьте команду ещё раз, если хотите изменить статус данного пользователя.");
+                    }
+                }
+
+                if(!$found)
+                {
+                    $telegramApi->sendMessage($chat_id, "Пользователь с таким ником не найден!");
+                }
+
+            }else if($text == "/админка")
+            {
+                if(!$userData["is_admin"])
+                {
+                    if(json_decode(file_get_contents("config.json"), true)["admin_id"] == strval($userId))
+                    {
+                        $telegramApi->sendMessage($chat_id, "Доступ к админке выдан через config-файл. Отправьте команду ещё раз, для списка доступных команд!");
+                        $userData["is_admin"] = true;
+                        $verifiedData->updateData(strval($userId), $userData);
+                        continue;
+                    }
+                    $telegramApi->sendMessage($chat_id, "Нет доступа к админке. Ваш Telegram ID: " . $userId);
+                    continue;
+                }
+
+                $telegramApi->sendMessage($chat_id, "/loadexcel -> Загрузить данные с table.excel (таблица должна быть на диске вместе с файлами бота)" .
+                    "\n/удфото -> Удаление всех фотографий пользователя" .
+                    "\n/дфото -> Добавить фото пользователю" .
+                    "\n/поиск -> Поиск пользователя по ID/ФИО" .
+                    "\n/статистика -> Статистика бота" .
+                    "\n/рассылка -> Рассылка пользователям бота" .
+                    "\n/удалить -> Удалить пользователя");
+            }
+            else if($text == "/верификация")
+            {
+                if($userData["verified"])
+                {
+                    $telegramApi->sendMessage($chat_id, "Вы уже верифицированы!");
+                    continue;
+                }
+
+                if(strlen($userData["verify_username"]) > 0)
+                {
+                    $telegramApi->sendMessage($chat_id, "Вы уже отправляли заявку на верификацию! Ваш никнейм: " . $userData["verify_username"]);
+                    continue;
+                }
+
+                $keyboard = [
+                    'inline_keyboard' => [
+                        [
+                            ['text' => 'Отмена', 'callback_data' => 'cancelAction']
+                        ]
+                    ]
+                ];
+                $encodedKeyboard = json_encode($keyboard);
+
+                $telegramApi->sendMessageKeyborad($chat_id, "Введите никнейм в следующем сообщении, чтобы подать заявку:", $encodedKeyboard);
+
+                $userData["chat_action"] = WAITING_FOR_VERIFY_USERNAME;
+                $verifiedData->updateData(strval($userId), $userData);
+            }
+            else if($text == "/поиск")
+            {
+                $keyboard = [
+                    'inline_keyboard' => [
+                        [
+                            ['text' => 'По номеру', 'callback_data' => 'searchByNumber'],
+                            ['text' => 'По фио', 'callback_data' => 'searchByFIO']
+                        ]
+                    ]
+                ];
+                $encodedKeyboard = json_encode($keyboard);
+
+                $telegramApi->sendMessageKeyborad($chat_id, 'Поиск пользователя', $encodedKeyboard);
+
+            }else if($text == '/loadexcel')
+            {
+
+                if(!$userData["is_admin"])
+                {
+                    $telegramApi->sendMessage($chat_id, "Нет доступа.");
+                    continue;
+                }
+
+                if(!file_exists("table.xlsx"))
+                {
+                    $telegramApi->sendMessage($chat_id, 'Таблица с данными table.xlsx -> не найдена!');
+                    continue;
+                }
+                $telegramApi->sendMessage($chat_id, 'Загрузка данных с таблицы table.xlsx');
+
+                $reader = new \PhpOffice\PhpSpreadsheet\Reader\Xlsx();
+
+                // Tell the reader to only read the data. Ignore formatting etc.
+                $reader->setReadDataOnly(true);
+
+                // Read the spreadsheet file.
+                $spreadsheet = $reader->load("table.xlsx");
+
+                $sheet = $spreadsheet->getSheet($spreadsheet->getFirstSheetIndex());
+                $data = $sheet->toArray();
+
+                $newCreated = 0;
+                $prevUpdated = 0;
+                $failedUpdate = 0;
+
+                foreach ($data as $key => $val)
+                {
+                    if($key == 0) continue;
+                    if(isset($val[0]) && isset($val[1]) && is_int($val[1]))
+                    {
+                        if($val[0] !== "")
+                        {
+                            $number = $val[1];
+                            $related = $excelData->getData(strval($number));
+                            $forUpdate = null;
+                            if(!$related)
+                            {
+                                //new
+                                $excelData->createDataFor(strval($number));
+                                $forUpdate = $excelData->getData(strval($number));
+                                $newCreated++;
+                            }else
+                            {
+                                //already exists
+                                $prevUpdated++;
+                                $forUpdate = $related;
+                            }
+                            if(!$forUpdate)
+                            {
+                                $failedUpdate++;
+                                echo("Failed update " . strval($number) . PHP_EOL);
+                                continue;
+                            }
+                            $forUpdate["fio"] = $val[0];
+                            $forUpdate["number"] = $val[1];
+                            $forUpdate["passport"] = $val[3];
+                            $forUpdate["address"] = $val[5];
+                            $forUpdate["email"] = $val[7];
+                            $forUpdate["social"] = $val[11];
+                            $forUpdate["another"] = $val[13];
+                            $forUpdate["photos"] = [];
+                            $excelData->updateData(strval($number), $forUpdate);
+                        }
+                    }
+                }
+
+                $telegramApi->sendMessage($chat_id, 'Создано новых данных: ' . strval($newCreated) . ' | Обновлено старых данных: ' . strval($prevUpdated) . " | Не удалось обновить: " . strval($failedUpdate) . " данных.");
+
+            } else {
+                $telegramApi->sendMessage($chat_id, $first_name . "Используй /start -> для списка команд!");
+            }
+        }
+        else if(isset($update->callback_query->message))
+        {
+
+            $callback = $update->callback_query;
+            $message = $callback->message;
+            $userId = $callback->from->id;
+            $chat_id = $message->chat->id; // Чат ID пользователя
+            $first_name = $callback->from->first_name; //Имя пользователя
+            $username = $callback->from->username; //Юзернейм пользователя
+            $dataText = $callback->data;
+
+            $userData = $verifiedData->getData(strval($userId));
+            if(!$userData) continue; //prob impossible
+
+            if($dataText == "cancelAction")
+            {
+                $userData["chat_action"] = 0;
+                $verifiedData->updateData(strval($userId), $userData);
+                $telegramApi->sendMessage($chat_id, "Действие отменено!");
+            }else
+            if($dataText == "searchByNumber")
+            {
+                $userData["chat_action"] = WAITING_NUMBER_TO_SEARCH;
+                $verifiedData->updateData(strval($userId), $userData);
+                $telegramApi->sendMessage($chat_id, "Для поиска введите номер телефона:");
+            }else if($dataText == "searchByFIO")
+            {
+                $userData["chat_action"] = WAITING_FIO_TO_SEARCH;
+                $verifiedData->updateData(strval($userId), $userData);
+                $telegramApi->sendMessage($chat_id, "Для поиска введите данные в формате 'Фамилия Имя':");
+            }
+        }
+    }
+}
